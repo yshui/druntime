@@ -60,23 +60,25 @@ int traceHandlerOpApplyImpl(const void*[] callstack, scope int delegate(ref size
 
     // find address -> file, line mapping using dwarf debug_line
     Array!Location locations;
-    auto image = Image.openSelf();
-    if (image.isValid)
-    {
-        auto debugLineSectionData = image.getDebugLineSectionData();
-
-        size_t baseAddr = 0;
-        if (image.isPIE)
-            baseAddr = getSelfBase();
-
-        if (debugLineSectionData)
+    auto images = currImages();
+    foreach(image; images) {
+        if (image.isValid)
         {
-            // resolve addresses
-            locations.length = callstack.length;
-            foreach(size_t i; 0 .. callstack.length)
-                locations[i].address = cast(size_t) callstack[i];
+            auto debugLineSectionData = image.getDebugLineSectionData();
 
-            resolveAddresses(debugLineSectionData, baseAddr, locations[]);
+            size_t baseAddr = 0;
+            if (image.isPIE)
+                baseAddr = image.baseAddr;
+
+            if (debugLineSectionData)
+            {
+                // resolve addresses
+                locations.length = callstack.length;
+                foreach(size_t i; 0 .. callstack.length)
+                    locations[i].address = cast(size_t) callstack[i];
+
+                resolveAddresses(debugLineSectionData, baseAddr, locations[]);
+            }
         }
     }
 

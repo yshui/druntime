@@ -20,9 +20,18 @@ version(linux_or_bsd):
 import core.sys.posix.fcntl;
 import core.sys.posix.unistd;
 
-version(linux) import core.sys.linux.elf;
-version(FreeBSD) import core.sys.freebsd.sys.elf;
-version(DragonFlyBSD) import core.sys.dragonflybsd.sys.elf;
+version(linux) {
+    import core.sys.linux.elf;
+    import core.sys.linux.link;
+}
+version(FreeBSD) {
+    import core.sys.freebsd.sys.elf;
+    import core.sys.freebsd.sys.link_elf;
+}
+version(DragonFlyBSD) {
+    import core.sys.dragonflybsd.sys.elf;
+    import core.sys.dragonflybsd.sys.link_elf;
+}
 
 struct Image
 {
@@ -38,6 +47,14 @@ struct Image
         return image;
     }
 
+    static Image fromPhdrInfo(dl_phdr_info *i) nothrow @nogc
+    {
+        Image image;
+        if (!ElfFile.fromMemory(&image.file, cast(void*)i.dlpi_addr))
+            image.file = ElfFile.init;
+        return image;
+    }
+
     @property bool isValid()
     {
         return file != ElfFile.init;
@@ -45,6 +62,10 @@ struct Image
     @property bool isPIE()
     {
         return file.ehdr.e_type == ET_DYN;
+    }
+    @property size_t baseAddr()
+    {
+        return file.baseAddr;
     }
 
     const(ubyte)[] getDebugLineSectionData()
@@ -64,12 +85,31 @@ struct Image
     }
 }
 
+/// Returns a iteratable struct for all currently loaded images
+Images currImages() {
+    return Images();
+}
+
 private:
+
+struct Images {
+    int opApply(scope int delegate(ref Image) nothrow dg)
+    {
+        int result = 0;
+        extern(C) int callback(dl_phdr_info *i, ulong, void *data) nothrow {
+            auto dg = cast(int delegate(ref Image) nothrow*)data;
+            auto img = Image.fromPhdrInfo(i);
+            return (*dg)(img);
+        }
+        return dl_iterate_phdr(&callback, cast(void*)&dg);
+    }
+}
 
 struct ElfFile
 {
     static bool openSelf(ElfFile* file) @nogc nothrow
     {
+        import core.sys.posix.sys.stat;
         version (linux)
         {
             auto selfPath = "/proc/self/exe".ptr;
@@ -89,12 +129,26 @@ struct ElfFile
         if (file.fd >= 0)
         {
             // memory map header
-            file.ehdr = MMapRegion!Elf_Ehdr(file.fd, 0, Elf_Ehdr.sizeof);
+            stat_t buf;
+            if (fstat(file.fd, &buf) < 0)
+                return false;
+            file.mmap = MMapGuard(file.fd, buf.st_size);
+            file.ehdr = file.mmap.get!Elf_Ehdr;
+            file.baseAddr = cast(size_t)file.ehdr;
             if (file.ehdr.isValidElfHeader())
                 return true;
             else
                 return false;
         }
+        else
+            return false;
+    }
+
+    static bool fromMemory(ElfFile* file, void *base) @nogc nothrow {
+        file.ehdr = cast(Elf_Ehdr*)base;
+        file.baseAddr = cast(size_t)base;
+        if (file.ehdr.isValidElfHeader)
+            return true;
         else
             return false;
     }
@@ -107,7 +161,9 @@ struct ElfFile
     }
 
     int fd = -1;
-    MMapRegion!Elf_Ehdr ehdr;
+    MMapGuard mmap;
+    const(Elf_Ehdr)* ehdr;
+    size_t baseAddr;
 }
 
 struct ElfSectionHeader
@@ -115,28 +171,22 @@ struct ElfSectionHeader
     this(const(ElfFile)* file, size_t index) @nogc nothrow
     {
         assert(Elf_Shdr.sizeof == file.ehdr.e_shentsize);
-        shdr = MMapRegion!Elf_Shdr(
-            file.fd,
+        shdr = file.mmap.get!Elf_Shdr(
             file.ehdr.e_shoff + index * file.ehdr.e_shentsize,
-            file.ehdr.e_shentsize
         );
     }
 
     @disable this(this);
 
     alias shdr this;
-    MMapRegion!Elf_Shdr shdr;
+    const(Elf_Shdr)* shdr;
 }
 
 struct ElfSection
 {
     this(ElfFile* file, ElfSectionHeader* shdr) @nogc nothrow
     {
-        data = MMapRegion!ubyte(
-            file.fd,
-            shdr.sh_offset,
-            shdr.sh_size,
-        );
+        data = file.mmap.get!ubyte(shdr.sh_offset);
 
         length = shdr.sh_size;
     }
@@ -145,12 +195,12 @@ struct ElfSection
 
     const(ubyte)[] get() @nogc nothrow
     {
-        return data.get()[0 .. length];
+        return data[0 .. length];
     }
 
     alias get this;
 
-    MMapRegion!ubyte data;
+    const(ubyte)* data;
     size_t length;
 }
 
@@ -220,20 +270,15 @@ bool isValidElfHeader(const(Elf_Ehdr)* ehdr) @nogc nothrow
     return true;
 }
 
-struct MMapRegion(T)
+struct MMapGuard
 {
     import core.sys.posix.sys.mman;
     import core.sys.posix.unistd;
 
-    this(int fd, size_t offset, size_t length) @nogc nothrow
+    this(int fd, size_t length) @nogc nothrow
     {
-        auto pagesize = sysconf(_SC_PAGESIZE);
-
-        auto realOffset = (offset / pagesize) * pagesize;
-        offsetDiff = offset - realOffset;
-        realLength = length + offsetDiff;
-
-        mptr = mmap(null, realLength, PROT_READ, MAP_PRIVATE, fd, realOffset);
+        realLength = length;
+        mptr = mmap(null, length, PROT_READ, MAP_PRIVATE, fd, 0);
     }
 
     @disable this(this);
@@ -243,15 +288,14 @@ struct MMapRegion(T)
         if (mptr) munmap(mptr, realLength);
     }
 
-    const(T)* get() const @nogc nothrow
+    const(T)* get(T)(size_t offset = 0) const
     {
-        return cast(T*)(mptr + offsetDiff);
+        return cast(T*)(mptr + offset);
     }
 
-    alias get this;
+    alias mptr this;
 
     size_t realLength;
-    size_t offsetDiff;
     void* mptr;
 }
 
